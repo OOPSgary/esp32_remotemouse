@@ -40,9 +40,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             s_retry_count++;
             ESP_LOGI(TAG, "Retrying Wi-Fi (%d/%d)...", s_retry_count, WIFI_MAX_RETRY);
         } else {
-            xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
-            // Reset counter so we keep retrying on next init
+            // Exhausted quick retries; signal the blocker to wait and try again.
+            // Reset the counter before signalling so the next esp_wifi_connect()
+            // call (issued by wifi_connect_blocking) gets a fresh retry budget.
             s_retry_count = 0;
+            xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
         }
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)event_data;

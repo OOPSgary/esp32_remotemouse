@@ -33,13 +33,14 @@ static const char *TAG = "BLE_HID";
 
 extern QueueHandle_t hid_event_queue; // defined in main.cpp
 
-// Per-device connection state
+// Per-device connection state.
+// Each slot maps to one registered GATTC application (app_id == slot index).
 typedef struct {
-    bool         in_use;
-    uint16_t     gattc_if;
+    uint16_t     gattc_if;            // assigned at ESP_GATTC_REG_EVT; 0 means not yet registered
+    bool         in_use;              // true when a device is actively connected on this slot
     uint16_t     conn_id;
     esp_bd_addr_t bda;
-    bool         is_keyboard; // true=keyboard, false=mouse (determined by service char UUIDs)
+    bool         is_keyboard;         // true=keyboard, false=mouse
     uint16_t     report_handle;       // handle of the chosen input report characteristic
     uint16_t     report_cccd_handle;  // handle of the CCCD for notifications
 } ble_dev_t;
@@ -60,6 +61,14 @@ static esp_ble_scan_params_t s_scan_params = {
 static ble_dev_t *find_free_slot(void) {
     for (int i = 0; i < BLE_HID_MAX_DEVICES; i++) {
         if (!s_devs[i].in_use) return &s_devs[i];
+    }
+    return NULL;
+}
+
+// Find a slot with a registered gattc_if that is not currently connected
+static ble_dev_t *find_idle_registered_slot(void) {
+    for (int i = 0; i < BLE_HID_MAX_DEVICES; i++) {
+        if (!s_devs[i].in_use && s_devs[i].gattc_if != 0) return &s_devs[i];
     }
     return NULL;
 }
@@ -123,16 +132,20 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
             // Skip if already connected
             if (find_dev_by_bda(scan->scan_rst.bda)) break;
 
-            // Skip if all slots are full
-            if (!find_free_slot()) break;
+            // Skip if no idle registered slot is available
+            if (!find_idle_registered_slot()) break;
 
             ESP_LOGI(TAG, "Found BLE HID device " MACSTR ", connecting...",
                      MAC2STR(scan->scan_rst.bda));
             esp_ble_gap_stop_scanning();
-            esp_ble_gattc_open(s_devs[0].gattc_if, // use first registered gattc_if for connect
-                               scan->scan_rst.bda,
-                               scan->scan_rst.ble_addr_type,
-                               true);
+            // Use an idle (registered but not connected) slot's gattc_if
+            ble_dev_t *idle = find_idle_registered_slot();
+            if (idle) {
+                esp_ble_gattc_open(idle->gattc_if,
+                                   scan->scan_rst.bda,
+                                   scan->scan_rst.ble_addr_type,
+                                   true);
+            }
         }
         break;
     }
@@ -152,17 +165,21 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
 {
     switch (event) {
     case ESP_GATTC_REG_EVT:
-        ESP_LOGI(TAG, "GATTC registered, if=%d status=%d", gattc_if, param->reg.status);
-        // Store gattc_if into the corresponding slot
-        for (int i = 0; i < BLE_HID_MAX_DEVICES; i++) {
-            if (!s_devs[i].in_use) {
-                s_devs[i].gattc_if = gattc_if;
-                break;
-            }
+        ESP_LOGI(TAG, "GATTC registered, app_id=%d if=%d status=%d",
+                 param->reg.app_id, gattc_if, param->reg.status);
+        // Each app_id (0..GATTC_APP_NUM-1) maps to the corresponding slot
+        if (param->reg.app_id < BLE_HID_MAX_DEVICES) {
+            s_devs[param->reg.app_id].gattc_if = gattc_if;
         }
-        // Set scan params once (only on first registration)
-        if (gattc_if == s_devs[0].gattc_if) {
-            esp_ble_gap_set_scan_params(&s_scan_params);
+        // Start scanning once all app registrations are complete
+        {
+            bool all_registered = true;
+            for (int i = 0; i < BLE_HID_MAX_DEVICES; i++) {
+                if (s_devs[i].gattc_if == 0) { all_registered = false; break; }
+            }
+            if (all_registered) {
+                esp_ble_gap_set_scan_params(&s_scan_params);
+            }
         }
         break;
 
@@ -173,14 +190,21 @@ static void gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_
             break;
         }
         {
-            ble_dev_t *slot = find_free_slot();
+            // Find the slot that owns this gattc_if (assigned at registration time)
+            ble_dev_t *slot = NULL;
+            for (int i = 0; i < BLE_HID_MAX_DEVICES; i++) {
+                if (s_devs[i].gattc_if == gattc_if && !s_devs[i].in_use) {
+                    slot = &s_devs[i];
+                    break;
+                }
+            }
             if (!slot) {
+                ESP_LOGW(TAG, "No free slot for gattc_if=%d, closing", gattc_if);
                 esp_ble_gattc_close(gattc_if, param->open.conn_id);
                 break;
             }
-            slot->in_use   = true;
-            slot->gattc_if = gattc_if;
-            slot->conn_id  = param->open.conn_id;
+            slot->in_use  = true;
+            slot->conn_id = param->open.conn_id;
             memcpy(slot->bda, param->open.remote_bda, ESP_BD_ADDR_LEN);
             ESP_LOGI(TAG, "Connected to " MACSTR, MAC2STR(slot->bda));
             // Save BDA to NVS
@@ -358,8 +382,8 @@ static void ble_hid_task(void *arg)
         for (int i = 0; i < n; i++) {
             if (devices[i].protocol != PAIRING_PROTO_BLE) continue;
             if (!find_dev_by_bda(devices[i].bda)) {
-                // Not currently connected – try to connect
-                ble_dev_t *slot = find_free_slot();
+                // Not currently connected – use an idle registered slot
+                ble_dev_t *slot = find_idle_registered_slot();
                 if (!slot) break;
                 ESP_LOGI(TAG, "Reconnecting to stored BLE device " MACSTR,
                          MAC2STR(devices[i].bda));
