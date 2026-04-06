@@ -433,6 +433,8 @@ void usb_hid_host_init(void)
     memset(s_devs, 0, sizeof(s_devs));
     s_ctrl_sem      = xSemaphoreCreateBinary();
     s_dev_evt_queue = xQueueCreate(8, sizeof(usb_dev_event_t));
+    configASSERT(s_ctrl_sem);
+    configASSERT(s_dev_evt_queue);
 
     // Install the USB Host Library.  The built-in hub driver starts
     // automatically – any hub plugged in will have its downstream ports
@@ -447,8 +449,11 @@ void usb_hid_host_init(void)
 
 void usb_hid_host_start_task(void)
 {
-    xTaskCreate(usb_daemon_task,     "usb_daemon", 4096, NULL, 5, NULL);
-    xTaskCreate(usb_hid_client_task, "usb_hid",    4096, NULL, 5, NULL);
+    BaseType_t ret;
+    ret = xTaskCreate(usb_daemon_task,     "usb_daemon", 4096, NULL, 5, NULL);
+    configASSERT(ret == pdPASS);
+    ret = xTaskCreate(usb_hid_client_task, "usb_hid",    4096, NULL, 5, NULL);
+    configASSERT(ret == pdPASS);
     ESP_LOGI(TAG, "USB HID tasks started (%d max interfaces)", USB_HID_MAX_DEVICES);
 }
 
