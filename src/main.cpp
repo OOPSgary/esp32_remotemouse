@@ -3,9 +3,10 @@
 // Topology:
 //   Bluetooth keyboard/mouse (BLE or Classic BT)
 //       ↓
-//   [ESP32]  ── Wi-Fi UDP ──→  [Windows PC 192.168.0.29:10086]
-//                                       ↓
-//                               SendInput OS injection
+//   [ESP32/ESP32-S3]  ── Wi-Fi UDP ──→  [Windows PC 192.168.0.29:10086]
+//       ↑                                          ↓
+//   USB keyboard/mouse                    SendInput OS injection
+//   (via hub / dock – ESP32-S3 only)
 //
 // LED (GPIO2) status:
 //   Slow blink (1 Hz)  – Bluetooth not yet connected
@@ -27,6 +28,7 @@
 #include "hid/hid_types.h"
 #include "bt/ble_hid_host.h"
 #include "bt/classic_hid_host.h"
+#include "usb/usb_hid_host.h"
 #include "net/udp_sender.h"
 #include "storage/pairing_store.h"
 
@@ -94,10 +96,15 @@ extern "C" void app_main(void)
     classic_hid_host_init();
     classic_hid_host_start_task();
 
-    // 7. Initialise Wi-Fi and start UDP sender task
+    // 7. Initialise USB HID Host (ESP32-S3 only; no-op on chips without USB OTG).
+    //    Hub support is built-in: keyboard + mouse can share a single USB hub.
+    usb_hid_host_init();
+    usb_hid_host_start_task();
+
+    // 8. Initialise Wi-Fi and start UDP sender task
     udp_sender_init();
 
-    // 8. LED status blink task
+    // 9. LED status blink task
     xTaskCreate(led_task, "led", 1024, NULL, 1, NULL);
 
     ESP_LOGI(TAG, "All subsystems started");
